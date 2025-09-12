@@ -1,7 +1,8 @@
-from typing import List
+from typing import AsyncGenerator, List
 
 from fastapi import Depends, FastAPI, HTTPException, Path, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from .database import Base, engine, get_db
 from .models import Booking, Event
 from .schemas import Booking as BookingSchema
 from .schemas import BookingCreate, Event as EventSchema
+from .sse import sse_manager
 
 app = FastAPI(
     title="Event Booking API",
@@ -19,6 +21,7 @@ app = FastAPI(
         {"name": "Health", "description": "Health check endpoints"},
         {"name": "Events", "description": "Event listing and details"},
         {"name": "Bookings", "description": "Create and list bookings"},
+        {"name": "Live Updates", "description": "Server-Sent Events for live seat availability"},
     ],
 )
 
@@ -39,6 +42,57 @@ Base.metadata.create_all(bind=engine)
 def health_check():
     """Health check endpoint."""
     return {"message": "Healthy"}
+
+
+@app.get(
+    "/events/{event_id}/stream",
+    response_class=PlainTextResponse,
+    summary="Stream Event Seat Updates (SSE)",
+    description="Open a Server-Sent Events (SSE) stream for a specific event to receive real-time seat availability updates. "
+                "The response is a text/event-stream. Clients should reconnect on network interruption.",
+    tags=["Live Updates"],
+)
+def stream_event_updates(
+    event_id: int = Path(..., description="ID of the event to subscribe for updates"),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Open an SSE stream for seat availability updates for a given event.
+
+    Returns a StreamingResponse with 'text/event-stream' content-type.
+    The stream yields messages whenever seat availability changes for this event.
+    """
+    event = db.get(Event, event_id)
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    async def generator() -> AsyncGenerator[str, None]:
+        # Emit initial state so the client knows current availability on subscribe
+        initial_payload = {
+            "event_id": event.id,
+            "available_seats": event.available_seats,
+            "total_seats": event.total_seats,
+            "type": "initial",
+        }
+        import json as _json
+        yield f"data: {_json.dumps(initial_payload)}\n\n"
+        async for chunk in sse_manager.event_stream(event_id):
+            yield chunk
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+@app.get(
+    "/docs/live-updates",
+    summary="How to use Live Updates (SSE)",
+    description="Returns a short usage note for connecting to the SSE endpoint from a frontend.",
+    tags=["Live Updates"],
+)
+def sse_usage_note() -> dict:
+    """Provide SSE client usage notes for documentation and quick testing."""
+    return {
+        "note": "Connect to /events/{event_id}/stream with EventSource in the browser.",
+        "example_js": "const es = new EventSource(`${BASE_URL}/events/1/stream`); es.onmessage = (e) => console.log(JSON.parse(e.data));",
+    }
 
 
 @app.get(
@@ -135,6 +189,30 @@ def create_booking(payload: BookingCreate, db: Session = Depends(get_db)) -> Boo
         db.add(event)
         db.commit()
         db.refresh(booking)
+
+        # After a successful booking and seat decrement, broadcast update to SSE subscribers
+        try:
+            # Fire-and-forget; if event loop not available (sync path), use asyncio
+            import asyncio
+
+            payload = {
+                "event_id": event.id,
+                "available_seats": event.available_seats,
+                "total_seats": event.total_seats,
+                "last_booking_id": booking.id,
+                "type": "seat_update",
+            }
+
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Schedule background task
+                loop.create_task(sse_manager.broadcast(event.id, payload))
+            else:
+                loop.run_until_complete(sse_manager.broadcast(event.id, payload))
+        except Exception:
+            # Avoid breaking API flow on broadcast failures
+            pass
+
         return booking
     except IntegrityError:
         db.rollback()
